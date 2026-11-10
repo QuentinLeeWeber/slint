@@ -2200,7 +2200,8 @@ impl WindowAdapter for WinitWindowAdapter {
             // If we're in fullscreen state, don't try to resize the window but maintain the surface
             // size we've been assigned to from the windowing system. Weston/Wayland don't like it
             // when we create a surface that's bigger than the screen due to constraints (#532).
-            if winit_window_or_none.fullscreen().is_none() && cfg!(not(target_arch = "wasm32")) {
+            // On wasm there is no fullscreen and we must not resize the canvas.
+            if winit_window_or_none.fullscreen().is_none() && !cfg!(target_arch = "wasm32") {
                 // TODO: don't ignore error, propagate to caller
                 let immediately_resized = self
                     .resize_window(winit::dpi::LogicalSize::new(width, height).into())
@@ -2220,9 +2221,8 @@ impl WindowAdapter for WinitWindowAdapter {
                 .unwrap();
         }
 
-        let m = properties.is_fullscreen() || cfg!(target_arch = "wasm32");
+        let m = properties.is_fullscreen();
         if m != self.fullscreen.get() {
-            #[cfg(not(target_arch = "wasm32"))]
             if m {
                 if winit_window_or_none.fullscreen().is_none() {
                     winit_window_or_none
@@ -2250,6 +2250,7 @@ impl WindowAdapter for WinitWindowAdapter {
         // maintain the surface size we've been assigned to from the
         // windowing system. Weston/Wayland don't like it when we create a
         // surface that's bigger than the screen due to constraints (#532).
+        // On wasm we also return early to let the browser control the canvas size.
         if winit_window_or_none.fullscreen().is_some() || cfg!(target_arch = "wasm32") {
             return;
         }
@@ -2275,20 +2276,6 @@ impl WindowAdapter for WinitWindowAdapter {
 
         if !platform_dictates_window_size() {
             adjust_window_size_to_satisfy_constraints(self, winit_min_inner, winit_max_inner);
-        }
-
-        // Auto-resize to the preferred size if users (SlintPad) requests it
-        #[cfg(target_arch = "wasm32")]
-        if let Some(canvas) =
-            winit_window_or_none.as_window().and_then(|winit_window| winit_window.canvas())
-        {
-            if is_preferred_sized_canvas(&canvas) {
-                let pref = new_constraints.preferred;
-                if pref.width > 0 as Coord || pref.height > 0 as Coord {
-                    // TODO: don't ignore error, propagate to caller
-                    self.resize_window(logical_size_to_winit(pref).into()).ok();
-                };
-            }
         }
     }
 
