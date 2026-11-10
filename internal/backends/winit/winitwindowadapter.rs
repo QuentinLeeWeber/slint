@@ -1908,6 +1908,8 @@ impl WinitWindowAdapter {
                 && preferred_size.height > 0 as Coord
                 // Don't set the preferred size as the user may have resized the window
                 && !recreating_window
+                // Don't set canvas to preferred size, because on wasm the preferred size is depended on the canvas size
+                && cfg!(not(target_arch = "wasm32"))
             {
                 // use the Slint's window Scale factor to take in account the override
                 let size = preferred_size.to_physical::<u32>(scale_factor);
@@ -2198,7 +2200,7 @@ impl WindowAdapter for WinitWindowAdapter {
             // If we're in fullscreen state, don't try to resize the window but maintain the surface
             // size we've been assigned to from the windowing system. Weston/Wayland don't like it
             // when we create a surface that's bigger than the screen due to constraints (#532).
-            if winit_window_or_none.fullscreen().is_none() {
+            if winit_window_or_none.fullscreen().is_none() && cfg!(not(target_arch = "wasm32")) {
                 // TODO: don't ignore error, propagate to caller
                 let immediately_resized = self
                     .resize_window(winit::dpi::LogicalSize::new(width, height).into())
@@ -2218,8 +2220,9 @@ impl WindowAdapter for WinitWindowAdapter {
                 .unwrap();
         }
 
-        let m = properties.is_fullscreen();
+        let m = properties.is_fullscreen() || cfg!(target_arch = "wasm32");
         if m != self.fullscreen.get() {
+            #[cfg(not(target_arch = "wasm32"))]
             if m {
                 if winit_window_or_none.fullscreen().is_none() {
                     winit_window_or_none
@@ -2247,7 +2250,7 @@ impl WindowAdapter for WinitWindowAdapter {
         // maintain the surface size we've been assigned to from the
         // windowing system. Weston/Wayland don't like it when we create a
         // surface that's bigger than the screen due to constraints (#532).
-        if winit_window_or_none.fullscreen().is_some() {
+        if winit_window_or_none.fullscreen().is_some() || cfg!(target_arch = "wasm32") {
             return;
         }
 
