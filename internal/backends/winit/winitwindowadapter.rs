@@ -268,15 +268,6 @@ fn subclass_window_for_transparent_erase(
     }
 }
 
-/// Whether the platform assigns the window its size, so requesting one is pointless.
-///
-/// On iOS and friends the window covers whatever the system hands it, and winit's UIKit
-/// backend ignores resize requests but turns an initial size into the UIWindow's frame,
-/// confining the app to a corner of the screen.
-fn platform_dictates_window_size() -> bool {
-    cfg!(ios_and_friends)
-}
-
 fn apply_scale_factor_to_logical_sizes_in_attributes(
     attributes: &mut WindowAttributes,
     scale_factor: f64,
@@ -538,6 +529,10 @@ pub struct WinitWindowAdapter {
     #[cfg(target_arch = "wasm32")]
     virtual_keyboard_helper: RefCell<Option<super::wasm_input_helper::WasmInputHelper>>,
 
+    /// Whether the page's CSS sizes the canvas, probed before winit writes its inline style.
+    #[cfg(target_arch = "wasm32")]
+    canvas_sized_by_css: core::cell::OnceCell<bool>,
+
     /// Set while a shown window waits for its first frame, see [`crate::macos::RevealOnFirstFrame`].
     #[cfg(target_os = "macos")]
     reveal_on_first_frame: RefCell<Option<crate::macos::RevealOnFirstFrame>>,
@@ -617,6 +612,8 @@ impl WinitWindowAdapter {
             renderer,
             #[cfg(target_arch = "wasm32")]
             virtual_keyboard_helper: Default::default(),
+            #[cfg(target_arch = "wasm32")]
+            canvas_sized_by_css: Default::default(),
             #[cfg(target_os = "macos")]
             reveal_on_first_frame: Default::default(),
             #[cfg(any(enable_accesskit, muda))]
@@ -763,7 +760,7 @@ impl WinitWindowAdapter {
         // Create the window at its preferred size: the renderer's surface is created together
         // with the window, and on Wayland resizing it afterwards only takes effect after the
         // next present, so the first frame would be rendered at the pre-show size.
-        if !platform_dictates_window_size()
+        if !self.platform_dictates_window_size()
             && !self.has_explicit_size.get()
             && window_attributes.fullscreen.is_none()
             && let Some(preferred_size) = self.preferred_size()
@@ -963,15 +960,7 @@ impl WinitWindowAdapter {
         {
             use winit::platform::web::WindowAttributesExtWebSys;
 
-            use wasm_bindgen::JsCast;
-
-            if let Some(html_canvas) = web_sys::window()
-                .ok_or_else(|| "winit backend: Could not retrieve DOM window".to_string())?
-                .document()
-                .ok_or_else(|| "winit backend: Could not retrieve DOM document".to_string())?
-                .get_element_by_id("canvas")
-                .and_then(|canvas_elem| canvas_elem.dyn_into::<web_sys::HtmlCanvasElement>().ok())
-            {
+            if let Some(html_canvas) = find_html_canvas()? {
                 attrs = attrs
                     .with_canvas(Some(html_canvas))
                     // Don't activate the window by default, as that will cause the page to scroll,
@@ -1115,10 +1104,36 @@ impl WinitWindowAdapter {
         false
     }
 
+    /// Whether the platform assigns the window its size, so requesting one is pointless.
+    ///
+    /// On iOS and friends the window covers whatever the system hands it, and winit's UIKit
+    /// backend ignores resize requests but turns an initial size into the UIWindow's frame,
+    /// confining the app to a corner of the screen.
+    ///
+    /// On the web the page's CSS lays out the canvas if it sizes it, unless the canvas sets
+    /// `data-slint-auto-resize-to-preferred="true"`.
+    /// winit writes requested and minimum/maximum sizes into the canvas' inline style,
+    /// which would override the page's CSS.
+    fn platform_dictates_window_size(&self) -> bool {
+        core::cfg_select! {
+            ios_and_friends => { true }
+            target_arch = "wasm32" => {
+                let canvas = match self.winit_window() {
+                    Some(winit_window) => winit_window.canvas(),
+                    None => find_html_canvas().ok().flatten(),
+                };
+                let Some(canvas) = canvas else { return false };
+                !is_preferred_sized_canvas(&canvas)
+                    && *self.canvas_sized_by_css.get_or_init(|| is_canvas_sized_by_css(&canvas))
+            }
+            _ => { false }
+        }
+    }
+
     // Requests for the window to be resized. Returns true if the window was resized immediately,
     // or if it will be resized later (false).
     fn resize_window(&self, size: winit::dpi::Size) -> Result<bool, PlatformError> {
-        if platform_dictates_window_size() {
+        if self.platform_dictates_window_size() {
             // The platform's size wins: re-announce it so the window item snaps back to it.
             self.resize_event(physical_size_to_winit(self.size.get()))?;
             return Ok(true);
@@ -1888,26 +1903,9 @@ impl WinitWindowAdapter {
 
             let scale_factor = runtime_window.scale_factor() as f64;
 
-            #[allow(unused_mut)]
-            let mut preferred_size = self.preferred_size().unwrap_or_default();
+            let preferred_size = self.preferred_size().unwrap_or_default();
 
-            #[cfg(target_arch = "wasm32")]
-            if let Some(html_canvas) = winit_window.canvas() {
-                // Try to maintain the existing size of the canvas element, if any
-                if !is_preferred_sized_canvas(&html_canvas)
-                    && !canvas_has_explicit_size_set(&html_canvas)
-                {
-                    let existing_canvas_size = winit::dpi::LogicalSize::new(
-                        html_canvas.client_width() as f32,
-                        html_canvas.client_height() as f32,
-                    );
-                    preferred_size.width = existing_canvas_size.width;
-
-                    preferred_size.height = existing_canvas_size.height;
-                }
-            }
-
-            if !platform_dictates_window_size()
+            if !self.platform_dictates_window_size()
                 && winit_window.fullscreen().is_none()
                 && !self.has_explicit_size.get()
                 && preferred_size.width > 0 as Coord
@@ -2269,19 +2267,19 @@ impl WindowAdapter for WinitWindowAdapter {
 
         self.constraints.set(new_constraints);
 
-        let resizable = window_is_resizable(new_constraints.min, new_constraints.max);
-        // we must call set_resizable before setting the min and max size otherwise setting the min and max size don't work on X11
-        winit_window_or_none.set_resizable(resizable);
-        // Important: Filter out (temporary?) zero width/heights, to avoid attempting to create a zero surface. For example, with wayland
-        // the client-side rendering ends up passing a zero width/height to the renderer.
-        let winit_min_inner =
-            new_constraints.min.map(logical_size_to_winit).map(filter_out_zero_width_or_height);
-        winit_window_or_none.set_min_inner_size(winit_min_inner, sf as f64);
-        let winit_max_inner =
-            new_constraints.max.map(logical_size_to_winit).map(filter_out_zero_width_or_height);
-        winit_window_or_none.set_max_inner_size(winit_max_inner, sf as f64);
+        if !self.platform_dictates_window_size() {
+            let resizable = window_is_resizable(new_constraints.min, new_constraints.max);
+            // we must call set_resizable before setting the min and max size otherwise setting the min and max size don't work on X11
+            winit_window_or_none.set_resizable(resizable);
+            // Important: Filter out (temporary?) zero width/heights, to avoid attempting to create a zero surface. For example, with wayland
+            // the client-side rendering ends up passing a zero width/height to the renderer.
+            let winit_min_inner =
+                new_constraints.min.map(logical_size_to_winit).map(filter_out_zero_width_or_height);
+            winit_window_or_none.set_min_inner_size(winit_min_inner, sf as f64);
+            let winit_max_inner =
+                new_constraints.max.map(logical_size_to_winit).map(filter_out_zero_width_or_height);
+            winit_window_or_none.set_max_inner_size(winit_max_inner, sf as f64);
 
-        if !platform_dictates_window_size() {
             adjust_window_size_to_satisfy_constraints(self, winit_min_inner, winit_max_inner);
         }
 
@@ -2677,22 +2675,31 @@ fn is_preferred_sized_canvas(canvas: &web_sys::HtmlCanvasElement) -> bool {
         .unwrap_or_default()
 }
 
-#[cfg(target_family = "wasm")]
-fn canvas_has_explicit_size_set(canvas: &web_sys::HtmlCanvasElement) -> bool {
-    let style = canvas.style();
-    if !style.get_property_value("width").unwrap_or_default().is_empty()
-        || !style.get_property_value("height").unwrap_or_default().is_empty()
-    {
-        return true;
-    }
+#[cfg(target_arch = "wasm32")]
+fn find_html_canvas() -> Result<Option<web_sys::HtmlCanvasElement>, PlatformError> {
+    use wasm_bindgen::JsCast;
 
-    let Some(window) = web_sys::window() else {
-        return false;
-    };
-    let Some(computed_style) = window.get_computed_style(&canvas).ok().flatten() else {
-        return false;
-    };
+    Ok(web_sys::window()
+        .ok_or_else(|| "winit backend: Could not retrieve DOM window".to_string())?
+        .document()
+        .ok_or_else(|| "winit backend: Could not retrieve DOM document".to_string())?
+        .get_element_by_id("canvas")
+        .and_then(|canvas_elem| canvas_elem.dyn_into::<web_sys::HtmlCanvasElement>().ok()))
+}
 
-    computed_style.get_property_value("width").ok().as_deref() != Some("auto")
-        || computed_style.get_property_value("height").ok().as_deref() != Some("auto")
+/// Whether CSS lays out the canvas, rather than its `width` and `height` attributes.
+///
+/// A computed style always resolves to pixels, so this changes the attributes
+/// and checks whether the layout follows.
+#[cfg(target_arch = "wasm32")]
+fn is_canvas_sized_by_css(canvas: &web_sys::HtmlCanvasElement) -> bool {
+    let (width, height) = (canvas.width(), canvas.height());
+    let layout_size = || (canvas.client_width(), canvas.client_height());
+    let before = layout_size();
+    canvas.set_width(width + 1);
+    canvas.set_height(height + 1);
+    let after = layout_size();
+    canvas.set_width(width);
+    canvas.set_height(height);
+    before.0 == after.0 || before.1 == after.1
 }
